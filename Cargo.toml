@@ -41,4 +41,4 @@ default-target = "x86_64-pc-windows-msvc"
 all-features = true
 
 [workspace]
-members = ["testbin", "dll"] # , "examples/with-iced"]
+members = ["testbin", "dll", "python"] # , "examples/with-iced"]

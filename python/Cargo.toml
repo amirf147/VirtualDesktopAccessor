@@ -1,0 +1,14 @@
+[package]
+name = "virtualdesktopaccessor"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "virtualdesktopaccessor"
+crate-type = ["cdylib"]
+
+[dependencies]
+winvd = { path = "../", features = ["crossbeam-channel"] }
+pyo3 = { version = "0.22", features = ["extension-module"] }
+windows = { version = "0.58", features = ["Win32_Foundation"] }
