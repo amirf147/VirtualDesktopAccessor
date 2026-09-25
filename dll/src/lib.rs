@@ -195,6 +195,10 @@ pub extern "C" fn UnPinApp(hwnd: HWND) -> i32 {
     unpin_app(hwnd).map_or(-1, |_| 1)
 }
 #[no_mangle]
+pub extern "C" fn SyncPinnedApps() -> i32 {
+    sync_pinned_apps().map_or(-1, |count| count as i32)
+}
+#[no_mangle]
 pub extern "C" fn IsWindowOnDesktopNumber(hwnd: HWND, desktop_number: i32) -> i32 {
     is_window_on_desktop(desktop_number, hwnd).map_or(-1, |b| b as i32)
 }

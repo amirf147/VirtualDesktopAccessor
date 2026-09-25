@@ -10,14 +10,20 @@ use windows::Win32::System::Com::CoIncrementMTAUsage;
 use windows::Win32::System::Com::CLSCTX_LOCAL_SERVER;
 use windows::{
     core::{Interface, GUID, HSTRING},
-    Win32::{System::Com::CoCreateInstance, UI::Shell::Common::IObjectArray},
+    Win32::{
+        System::Com::{CoCreateInstance, CoTaskMemFree},
+        UI::Shell::Common::IObjectArray,
+    },
 };
 
 #[cfg(debug_assertions)]
 use crate::log::log_output;
 
-type WCHAR = u16;
-type APPIDPWSTR = *const WCHAR;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AppIdInfo {
+    pub raw: String,
+    pub base: String,
+}
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Error {
@@ -606,6 +612,7 @@ impl ComObjects {
 
     #[apply(retry_function)]
     pub fn switch_desktop(&self, desktop: &DesktopInternal) -> Result<()> {
+        let _ = self.sync_pinned_apps();
         let desktop = self.get_idesktop(desktop)?;
         unsafe {
             self.get_manager_internal()?
@@ -749,47 +756,194 @@ impl ComObjects {
         Ok(())
     }
 
-    #[apply(retry_function)]
-    fn get_iapplication_id_for_view(&self, view: &IApplicationView) -> Result<APPIDPWSTR> {
-        let mut app_id: APPIDPWSTR = std::ptr::null_mut();
+    fn get_views_by_zorder(&self) -> Result<IObjectArray> {
+        let mut views = None;
         unsafe {
-            view.get_app_user_model_id(&mut app_id as *mut _ as *mut _)
+            self.get_view_collection()?
+                .get_views_by_zorder(&mut views)
                 .as_result()?
         }
-        Ok(app_id)
+        views.ok_or(Error::ComAllocatedNullPtr)
+    }
+
+    fn for_each_view<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&IApplicationView) -> Result<()>,
+    {
+        let views = match self.get_views_by_zorder() {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
+        let count = unsafe { views.GetCount().unwrap_or(0) };
+        for i in 0..count {
+            if let Ok(view) = unsafe { views.GetAt::<IApplicationView>(i) } {
+                let _ = f(&view);
+            }
+        }
+        Ok(())
+    }
+
+    fn get_app_id_info_for_view(&self, view: &IApplicationView) -> Result<Option<AppIdInfo>> {
+        let mut raw_ptr: *mut u16 = std::ptr::null_mut();
+        let hr = unsafe { view.get_app_user_model_id(&mut raw_ptr) };
+        if hr.is_err() || raw_ptr.is_null() {
+            return Ok(None);
+        }
+
+        let raw = unsafe {
+            let mut len = 0;
+            while *raw_ptr.add(len) != 0 {
+                len += 1;
+            }
+            let slice = std::slice::from_raw_parts(raw_ptr, len);
+            let s = String::from_utf16_lossy(slice);
+            CoTaskMemFree(Some(raw_ptr as *const _));
+            s
+        };
+
+        if raw.is_empty() {
+            return Ok(None);
+        }
+
+        let base = match raw.split_once("~Wh~") {
+            Some((prefix, _)) => prefix.to_string(),
+            None => raw.clone(),
+        };
+
+        Ok(Some(AppIdInfo { raw, base }))
     }
 
     #[apply(retry_function)]
     pub fn is_pinned_app(&self, window: &HWND) -> Result<bool> {
         let view = self.get_iapplication_view_for_hwnd(window)?;
-        let app_id = self.get_iapplication_id_for_view(&view)?;
+        let app_info = match self.get_app_id_info_for_view(&view)? {
+            Some(info) => info,
+            None => return self.is_pinned_window(window),
+        };
+
+        let pinned_apps = self.get_pinned_apps()?;
+        let base_wide = format!("{}\0", app_info.base).encode_utf16().collect::<Vec<_>>();
+        let mut is_pinned = false;
+
         unsafe {
-            let mut value = false;
-            self.get_pinned_apps()?
-                .is_app_pinned(app_id, &mut value)
+            pinned_apps
+                .is_app_pinned(base_wide.as_ptr(), &mut is_pinned)
                 .as_result()?;
-            Ok(value)
         }
+        if is_pinned {
+            return Ok(true);
+        }
+
+        if app_info.raw != app_info.base {
+            let raw_wide = format!("{}\0", app_info.raw).encode_utf16().collect::<Vec<_>>();
+            unsafe {
+                let _ = pinned_apps.is_app_pinned(raw_wide.as_ptr(), &mut is_pinned);
+            }
+        }
+
+        Ok(is_pinned)
     }
 
     #[apply(retry_function)]
     pub fn pin_app(&self, window: &HWND) -> Result<()> {
-        let view = self.get_iapplication_view_for_hwnd(window)?;
-        let app_id = self.get_iapplication_id_for_view(&view)?;
+        let current_view = self.get_iapplication_view_for_hwnd(window)?;
+        let app_info = match self.get_app_id_info_for_view(&current_view)? {
+            Some(info) => info,
+            None => return self.pin_window(window),
+        };
+
+        let pinned_apps = self.get_pinned_apps()?;
+        let base_wide = format!("{}\0", app_info.base).encode_utf16().collect::<Vec<_>>();
+
+        // 1. Register canonical package identity
         unsafe {
-            self.get_pinned_apps()?.pin_app(app_id).as_result()?;
+            pinned_apps.pin_app(base_wide.as_ptr()).as_result()?;
         }
+
+        // 2. Iterate all active views and pin sibling instances (Task View parity)
+        self.for_each_view(|sub_view| {
+            if let Ok(Some(sub_info)) = self.get_app_id_info_for_view(sub_view) {
+                if sub_info.base == app_info.base {
+                    unsafe {
+                        let _ = pinned_apps.pin_view(ComIn::new(sub_view));
+                    }
+                }
+            }
+            Ok(())
+        })?;
+
         Ok(())
     }
 
     #[apply(retry_function)]
     pub fn unpin_app(&self, window: &HWND) -> Result<()> {
-        let view = self.get_iapplication_view_for_hwnd(window)?;
-        let app_id = self.get_iapplication_id_for_view(&view)?;
+        let current_view = self.get_iapplication_view_for_hwnd(window)?;
+        let app_info = match self.get_app_id_info_for_view(&current_view)? {
+            Some(info) => info,
+            None => return self.unpin_window(window),
+        };
+
+        let pinned_apps = self.get_pinned_apps()?;
+        let base_wide = format!("{}\0", app_info.base).encode_utf16().collect::<Vec<_>>();
+
+        // 1. Unpin canonical package
         unsafe {
-            self.get_pinned_apps()?.unpin_app(app_id).as_result()?;
+            pinned_apps.unpin_app(base_wide.as_ptr()).as_result()?;
         }
+
+        // 2. Unpin raw ID if it was different
+        if app_info.raw != app_info.base {
+            let raw_wide = format!("{}\0", app_info.raw).encode_utf16().collect::<Vec<_>>();
+            unsafe {
+                let _ = pinned_apps.unpin_app(raw_wide.as_ptr());
+            }
+        }
+
+        // 3. Unpin all sibling views
+        self.for_each_view(|sub_view| {
+            if let Ok(Some(sub_info)) = self.get_app_id_info_for_view(sub_view) {
+                if sub_info.base == app_info.base {
+                    unsafe {
+                        let _ = pinned_apps.unpin_view(ComIn::new(sub_view));
+                    }
+                }
+            }
+            Ok(())
+        })?;
+
         Ok(())
+    }
+
+    #[apply(retry_function)]
+    pub fn sync_pinned_apps(&self) -> Result<u32> {
+        let pinned_apps = self.get_pinned_apps()?;
+        let mut count = 0;
+
+        self.for_each_view(|sub_view| {
+            let mut is_view_pinned = false;
+            let hr = unsafe {
+                pinned_apps.is_view_pinned(ComIn::new(sub_view), &mut is_view_pinned)
+            };
+            if hr.is_ok() && is_view_pinned {
+                return Ok(());
+            }
+
+            if let Ok(Some(sub_info)) = self.get_app_id_info_for_view(sub_view) {
+                let base_wide = format!("{}\0", sub_info.base).encode_utf16().collect::<Vec<_>>();
+                let mut is_app_pinned = false;
+                let hr_app = unsafe { pinned_apps.is_app_pinned(base_wide.as_ptr(), &mut is_app_pinned) };
+                if hr_app.is_ok() && is_app_pinned {
+                    unsafe {
+                        if pinned_apps.pin_view(ComIn::new(sub_view)).is_ok() {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })?;
+
+        Ok(count)
     }
 
     #[apply(retry_function)]

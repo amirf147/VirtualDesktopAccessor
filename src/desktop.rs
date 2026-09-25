@@ -243,3 +243,8 @@ pub fn pin_app(hwnd: HWND) -> Result<()> {
 pub fn unpin_app(hwnd: HWND) -> Result<()> {
     with_com_objects(move |o| o.unpin_app(&hwnd))
 }
+
+/// Synchronize all open windows belonging to pinned applications across desktops
+pub fn sync_pinned_apps() -> Result<u32> {
+    with_com_objects(|o| o.sync_pinned_apps())
+}

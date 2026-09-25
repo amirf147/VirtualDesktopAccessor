@@ -325,14 +325,14 @@ pub unsafe trait IVirtualDesktop: IUnknown {
 
 #[windows_interface::interface("1841c6d7-4f9d-42c0-af41-8747538f10e5")]
 pub unsafe trait IApplicationViewCollection: IUnknown {
-    pub unsafe fn get_views(&self, out_views: *mut IObjectArray) -> HRESULT;
+    pub unsafe fn get_views(&self, out_views: *mut Option<IObjectArray>) -> HRESULT;
 
-    pub unsafe fn get_views_by_zorder(&self, out_views: *mut IObjectArray) -> HRESULT;
+    pub unsafe fn get_views_by_zorder(&self, out_views: *mut Option<IObjectArray>) -> HRESULT;
 
     pub unsafe fn get_views_by_app_user_model_id(
         &self,
         id: PCWSTR,
-        out_views: *mut IObjectArray,
+        out_views: *mut Option<IObjectArray>,
     ) -> HRESULT;
 
     pub unsafe fn get_view_for_hwnd(
