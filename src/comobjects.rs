@@ -16,6 +16,12 @@ use windows::{
 #[cfg(debug_assertions)]
 use crate::log::log_output;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AppIdInfo {
+    pub raw: String,
+    pub base: String,
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum Error {
     /// Window is not found
@@ -746,47 +752,189 @@ impl ComObjects {
         Ok(())
     }
 
-    #[apply(retry_function)]
-    fn get_iapplication_id_for_view(&self, view: &IApplicationView) -> Result<APPIDPWSTR> {
-        let mut app_id = APPIDPWSTR::default();
+    fn get_views_by_zorder(&self) -> Result<IObjectArray> {
+        let mut views = None;
         unsafe {
-            view.get_app_user_model_id(&mut app_id.0)
+            self.get_view_collection()?
+                .get_views_by_zorder(&mut views)
                 .as_result()?
         }
-        Ok(app_id)
+        views.ok_or(Error::ComAllocatedNullPtr)
+    }
+
+    fn for_each_view<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&IApplicationView) -> Result<()>,
+    {
+        let views = match self.get_views_by_zorder() {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
+        let count = unsafe { views.GetCount().unwrap_or(0) };
+        for i in 0..count {
+            if let Ok(view) = unsafe { views.GetAt::<IApplicationView>(i) } {
+                let _ = f(&view);
+            }
+        }
+        Ok(())
+    }
+
+    fn for_each_matching_view<F>(&self, target_base_id: &str, mut f: F) -> Result<()>
+    where
+        F: FnMut(&IApplicationView) -> Result<()>,
+    {
+        self.for_each_view(|sub_view| {
+            if let Ok(Some(sub_info)) = self.get_app_id_info_for_view(sub_view) {
+                if sub_info.base == target_base_id {
+                    let _ = f(sub_view);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn get_app_id_info_for_view(&self, view: &IApplicationView) -> Result<Option<AppIdInfo>> {
+        let mut app_id = APPIDPWSTR::default();
+        let hr = unsafe { view.get_app_user_model_id(&mut app_id.0) };
+        if hr.is_err() || app_id.is_null() {
+            return Ok(None);
+        }
+
+        let raw = match app_id.to_string_lossy() {
+            Some(s) if !s.is_empty() => s,
+            _ => return Ok(None),
+        };
+
+        let base = match raw.split_once("~Wh~") {
+            Some((prefix, _)) => prefix.to_string(),
+            None => raw.clone(),
+        };
+
+        Ok(Some(AppIdInfo { raw, base }))
     }
 
     #[apply(retry_function)]
     pub fn is_pinned_app(&self, window: &HWND) -> Result<bool> {
         let view = self.get_iapplication_view_for_hwnd(window)?;
-        let app_id = self.get_iapplication_id_for_view(&view)?;
+        let app_info = match self.get_app_id_info_for_view(&view)? {
+            Some(info) => info,
+            None => return self.is_pinned_window(window),
+        };
+
+        let pinned_apps = self.get_pinned_apps()?;
+        let base_app_id = APPIDPWSTR::from_str(&app_info.base).ok_or(Error::ComAllocatedNullPtr)?;
+        let mut is_pinned = false;
+
         unsafe {
-            let mut value = false;
-            self.get_pinned_apps()?
-                .is_app_pinned(app_id, &mut value)
+            pinned_apps
+                .is_app_pinned(base_app_id, &mut is_pinned)
                 .as_result()?;
-            Ok(value)
         }
+        if is_pinned {
+            return Ok(true);
+        }
+
+        if app_info.raw != app_info.base {
+            if let Some(raw_app_id) = APPIDPWSTR::from_str(&app_info.raw) {
+                unsafe {
+                    let _ = pinned_apps.is_app_pinned(raw_app_id, &mut is_pinned);
+                }
+            }
+        }
+
+        Ok(is_pinned)
     }
 
     #[apply(retry_function)]
     pub fn pin_app(&self, window: &HWND) -> Result<()> {
-        let view = self.get_iapplication_view_for_hwnd(window)?;
-        let app_id = self.get_iapplication_id_for_view(&view)?;
+        let current_view = self.get_iapplication_view_for_hwnd(window)?;
+        let app_info = match self.get_app_id_info_for_view(&current_view)? {
+            Some(info) => info,
+            None => return self.pin_window(window),
+        };
+
+        let pinned_apps = self.get_pinned_apps()?;
+        let base_app_id = APPIDPWSTR::from_str(&app_info.base).ok_or(Error::ComAllocatedNullPtr)?;
+
+        // 1. Register canonical package identity
         unsafe {
-            self.get_pinned_apps()?.pin_app(app_id).as_result()?;
+            pinned_apps.pin_app(base_app_id).as_result()?;
         }
+
+        // 2. Iterate all active views and pin sibling instances (Task View parity)
+        self.for_each_matching_view(&app_info.base, |sub_view| unsafe {
+            let _ = pinned_apps.pin_view(ComIn::new(sub_view));
+            Ok(())
+        })?;
+
         Ok(())
     }
 
     #[apply(retry_function)]
     pub fn unpin_app(&self, window: &HWND) -> Result<()> {
-        let view = self.get_iapplication_view_for_hwnd(window)?;
-        let app_id = self.get_iapplication_id_for_view(&view)?;
+        let current_view = self.get_iapplication_view_for_hwnd(window)?;
+        let app_info = match self.get_app_id_info_for_view(&current_view)? {
+            Some(info) => info,
+            None => return self.unpin_window(window),
+        };
+
+        let pinned_apps = self.get_pinned_apps()?;
+        let base_app_id = APPIDPWSTR::from_str(&app_info.base).ok_or(Error::ComAllocatedNullPtr)?;
+
+        // 1. Unpin canonical package
         unsafe {
-            self.get_pinned_apps()?.unpin_app(app_id).as_result()?;
+            pinned_apps.unpin_app(base_app_id).as_result()?;
         }
+
+        // 2. Unpin raw ID if it was different
+        if app_info.raw != app_info.base {
+            if let Some(raw_app_id) = APPIDPWSTR::from_str(&app_info.raw) {
+                unsafe {
+                    let _ = pinned_apps.unpin_app(raw_app_id);
+                }
+            }
+        }
+
+        // 3. Unpin all sibling views
+        self.for_each_matching_view(&app_info.base, |sub_view| unsafe {
+            let _ = pinned_apps.unpin_view(ComIn::new(sub_view));
+            Ok(())
+        })?;
+
         Ok(())
+    }
+
+    #[apply(retry_function)]
+    pub fn sync_pinned_apps(&self) -> Result<u32> {
+        let pinned_apps = self.get_pinned_apps()?;
+        let mut count = 0;
+
+        self.for_each_view(|sub_view| {
+            let mut is_view_pinned = false;
+            let hr = unsafe {
+                pinned_apps.is_view_pinned(ComIn::new(sub_view), &mut is_view_pinned)
+            };
+            if hr.is_ok() && is_view_pinned {
+                return Ok(());
+            }
+
+            if let Ok(Some(sub_info)) = self.get_app_id_info_for_view(sub_view) {
+                if let Some(base_app_id) = APPIDPWSTR::from_str(&sub_info.base) {
+                    let mut is_app_pinned = false;
+                    let hr_app = unsafe { pinned_apps.is_app_pinned(base_app_id, &mut is_app_pinned) };
+                    if hr_app.is_ok() && is_app_pinned {
+                        unsafe {
+                            if pinned_apps.pin_view(ComIn::new(sub_view)).is_ok() {
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })?;
+
+        Ok(count)
     }
 
     #[apply(retry_function)]

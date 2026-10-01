@@ -1,4 +1,4 @@
-#![allow(non_camel_case_types)]
+#![allow(non_camel_case_types, non_upper_case_globals, clippy::upper_case_acronyms)]
 /// Interface definitions for the Virtual Desktop API
 ///
 /// Most of the functions are not tested or used, beware if you try to use these
@@ -35,7 +35,6 @@
 ///
 /// If you read the rules carefully, ComIn is most common usecase in Rust
 /// API definitions as most parameters are `In` parameters.
-#[allow(non_upper_case_globals)]
 use std::ffi::c_void;
 use std::ops::Deref;
 use windows::{
@@ -175,8 +174,44 @@ impl APPIDPWSTR {
         self.0.is_null()
     }
 
+    #[allow(dead_code)]
     pub fn as_ptr(&self) -> *const WCHAR {
         self.0
+    }
+
+    #[allow(dead_code)]
+    pub fn as_pcwstr(&self) -> PCWSTR {
+        self.0
+    }
+
+    pub fn to_string_lossy(&self) -> Option<String> {
+        if self.0.is_null() {
+            return None;
+        }
+        unsafe {
+            let mut len = 0;
+            while *self.0.add(len) != 0 {
+                len += 1;
+            }
+            if len == 0 {
+                return None;
+            }
+            let slice = std::slice::from_raw_parts(self.0, len);
+            Some(String::from_utf16_lossy(slice))
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        let wide: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+        let bytes = wide.len() * std::mem::size_of::<u16>();
+        let ptr = unsafe { windows::Win32::System::Com::CoTaskMemAlloc(bytes) as *mut u16 };
+        if ptr.is_null() {
+            return None;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
+        }
+        Some(Self(ptr))
     }
 }
 
@@ -370,14 +405,14 @@ pub unsafe trait IVirtualDesktop: IUnknown {
 
 #[windows_interface::interface("1841c6d7-4f9d-42c0-af41-8747538f10e5")]
 pub unsafe trait IApplicationViewCollection: IUnknown {
-    pub unsafe fn get_views(&self, out_views: *mut IObjectArray) -> HRESULT;
+    pub unsafe fn get_views(&self, out_views: *mut Option<IObjectArray>) -> HRESULT;
 
-    pub unsafe fn get_views_by_zorder(&self, out_views: *mut IObjectArray) -> HRESULT;
+    pub unsafe fn get_views_by_zorder(&self, out_views: *mut Option<IObjectArray>) -> HRESULT;
 
     pub unsafe fn get_views_by_app_user_model_id(
         &self,
         id: PCWSTR,
-        out_views: *mut IObjectArray,
+        out_views: *mut Option<IObjectArray>,
     ) -> HRESULT;
 
     pub unsafe fn get_view_for_hwnd(
